@@ -349,6 +349,13 @@ interface GoogleQuotaAccountSnapshot {
 	worstRemainingPercent?: number;
 }
 
+interface QuotaCacheEntry {
+	result: QuotaCheckResult;
+	timestamp: number;
+}
+const quotaCache = new Map<string, QuotaCacheEntry>();
+const QUOTA_CACHE_TTL_MS = 20 * 1000; // 20 seconds cache TTL
+
 function decodeJwtPayload(token: string): Record<string, unknown> {
 	const parts = token.split(".");
 	if (parts.length < 2) return {};
@@ -741,13 +748,33 @@ async function showWrappedSelect(
 async function runQuotaChecks(
 	accounts: QuotaAccount[],
 	signal?: AbortSignal,
+	bypassCache = false,
 ): Promise<QuotaCheckResult[]> {
+	const now = Date.now();
 	const results = await Promise.all(accounts.map(async (account) => {
+		if (!bypassCache) {
+			const cached = quotaCache.get(account.providerName);
+			if (cached && now - cached.timestamp < QUOTA_CACHE_TTL_MS) {
+				return cached.result;
+			}
+		}
 		const checker = PROVIDER_QUOTA_CHECKERS.find(
 			(candidate) => candidate.baseProvider === account.baseProvider,
 		);
 		if (!checker) return undefined;
-		return checker.check(account, signal);
+		try {
+			const result = await checker.check(account, signal);
+			quotaCache.set(account.providerName, { result, timestamp: now });
+			return result;
+		} catch (err) {
+			return {
+				account,
+				kind: "error" as const,
+				summary: err instanceof Error ? err.message : String(err),
+				details: [err instanceof Error ? err.message : String(err)],
+				score: 0,
+			};
+		}
 	}));
 
 	return results
@@ -758,9 +785,10 @@ async function runQuotaChecks(
 async function loadQuotaResults(
 	ctx: ExtensionCommandContext,
 	accounts: QuotaAccount[],
+	bypassCache = false,
 ): Promise<QuotaCheckResult[] | null> {
 	if (!ctx.hasUI) {
-		return runQuotaChecks(accounts);
+		return runQuotaChecks(accounts, undefined, bypassCache);
 	}
 
 	return ctx.ui.custom<QuotaCheckResult[] | null>((tui, theme, _kb, done) => {
@@ -771,7 +799,7 @@ async function loadQuotaResults(
 		);
 		loader.onAbort = () => done(null);
 
-		runQuotaChecks(accounts, loader.signal)
+		runQuotaChecks(accounts, loader.signal, bypassCache)
 			.then(done)
 			.catch((error) => {
 				if (loader.signal.aborted) {
@@ -1391,7 +1419,7 @@ async function handleSubsLimits(ctx: ExtensionCommandContext): Promise<void> {
 		return;
 	}
 
-	const results = await loadQuotaResults(ctx, accounts);
+	const results = await loadQuotaResults(ctx, accounts, true);
 	if (!results) {
 		ctx.ui.notify("Cancelled subscription limit check.", "info");
 		return;
@@ -1876,19 +1904,18 @@ function getBaseProvider(providerName: string): string | undefined {
 
 function cloneModels(originalProvider: string, index: number) {
 	const models = getModels(originalProvider as any) as Model<Api>[];
-	return models.map((m) => ({
-		id: m.id,
-		name: `${m.name} (#${index})`,
-		api: m.api,
-		reasoning: m.reasoning,
-		input: m.input as ("text" | "image")[],
-		cost: { ...m.cost },
-		contextWindow: m.contextWindow,
-		maxTokens: m.maxTokens,
-		headers: m.headers ? { ...m.headers } : undefined,
-		compat: m.compat,
-	}));
+	return models.map((m) => {
+		const { provider, ...rest } = m as any;
+		return {
+			...rest,
+			name: `${m.name} (#${index})`,
+			cost: { ...m.cost },
+			headers: m.headers ? { ...m.headers } : undefined,
+		};
+	});
 }
+
+
 
 // ==========================================================================
 // Register a single subscription as a provider
@@ -2397,6 +2424,103 @@ class PoolManager {
 		if (!poolName) return;
 		const state = this.getOrCreatePoolState(poolName);
 		state.exhausted.set(providerName, Date.now());
+	}
+
+	async enforceProactiveRotation(
+		ctx: ExtensionContext | ExtensionCommandContext,
+	): Promise<boolean> {
+		const currentModel = ctx.model;
+		if (!currentModel) return false;
+
+		const pool = this.getPoolForProvider(currentModel.provider);
+		if (!pool) return false;
+
+		const effective = loadEffectiveConfig(ctx.cwd);
+		const account: QuotaAccount = {
+			providerName: currentModel.provider,
+			baseProvider: getBaseProvider(currentModel.provider) || currentModel.provider,
+			displayName: getProviderDisplayName(currentModel.provider, effective.subscriptions),
+			auth: ctx.modelRegistry.authStorage.get(currentModel.provider) as AuthStorageEntry | undefined,
+		};
+
+		try {
+			const [result] = await runQuotaChecks([account]);
+			if (result && result.kind === "blocked") {
+				ctx.ui.notify(
+					`[pool:${pool.name}] Proactive rotation: ${currentModel.provider} is at <= 5% quota. Switching...`,
+					"info",
+				);
+				this.markExhausted(currentModel.provider);
+
+				const plan = this.buildFailoverPlan(
+					currentModel,
+					normalizeMultiPassConfig({
+						subscriptions: effective.subscriptions,
+						pools: effective.pools,
+						chains: effective.chains,
+						presets: effective.presets,
+					}),
+					ctx.modelRegistry.authStorage,
+					{
+						attemptedProviders: new Set([currentModel.provider]),
+						visitedChainIndexes: new Set<number>(),
+					},
+				);
+
+				// Strategy-aware reordering of pool candidates
+				const cascade: FailoverCascadeState = {
+					prompt: "",
+					attemptedProviders: new Set([currentModel.provider]),
+					visitedChainIndexes: new Set<number>(),
+				};
+				await this.reorderCandidatesByStrategy(
+					pool,
+					plan,
+					currentModel,
+					ctx as any,
+					cascade,
+					null,
+				);
+
+				const nextCandidate = plan.candidates[0];
+				if (!nextCandidate) {
+					ctx.ui.notify(
+						`[pool:${pool.name}] Proactive failover exhausted; no later eligible target`,
+						"warning",
+					);
+					return false;
+				}
+
+				const nextModel = ctx.modelRegistry.find(nextCandidate.provider, nextCandidate.modelId);
+				if (!nextModel) {
+					ctx.ui.notify(
+						`[pool:${pool.name}] Proactive failover target ${nextCandidate.provider} is missing`,
+						"warning",
+					);
+					return false;
+				}
+
+				const success = await this.pi.setModel(nextModel);
+				if (!success) {
+					ctx.ui.notify(
+						`[pool:${pool.name}] Failed to proactively switch to ${nextCandidate.provider}`,
+						"warning",
+					);
+					return false;
+				}
+
+				ctx.ui.notify(
+					`[pool:${pool.name}] Proactively rotated from ${currentModel.provider} to ${nextCandidate.provider} (${nextModel.id})`,
+					"info",
+				);
+				ctx.ui.setStatus("multi-pass", formatFailoverStatus(nextCandidate));
+				return true;
+			}
+		} catch (error) {
+			// Don't crash or block user message execution on quota check failure
+		}
+
+		return false;
 	}
 
 	/** Get the next available member in a pool, skipping the current one */
@@ -4421,6 +4545,15 @@ function classifyPoolMemberSkip(
 			detail: `${provider} skipped (cooldown active)`,
 		};
 	}
+	const cached = quotaCache.get(provider);
+	if (cached && cached.result.kind === "blocked") {
+		return {
+			type: "pool-member",
+			poolName,
+			reason: "exhausted",
+			detail: `${provider} skipped (quota <= 5%)`,
+		};
+	}
 	return null;
 }
 
@@ -5485,6 +5618,7 @@ export default function multiSub(pi: ExtensionAPI) {
 	// Listen for user input to track last prompt
 	pi.on("before_agent_start", async (event, ctx) => {
 		lastUserPrompt = event.prompt;
+		await poolManager.enforceProactiveRotation(ctx);
 		poolManager.startTurn(event.prompt, ctx.model);
 	});
 
