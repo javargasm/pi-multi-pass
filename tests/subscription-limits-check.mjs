@@ -585,6 +585,65 @@ function runLimitsArrayParsingChecks() {
   console.log("limits-array parsing checks passed");
 }
 
+function runUsageBarsCacheChecks() {
+  // Mirror the logic from multi-sub.ts tryBuildFromUsageBarsCache
+  function tryBuildFromCache(session, weekly, ageMs) {
+    const TTL = 30_000;
+    if (ageMs > TTL) return null;
+
+    const sessionLeft = Math.max(0, Math.min(100, 100 - session));
+    const weeklyLeft = Math.max(0, Math.min(100, 100 - weekly));
+    const bottleneck = Math.min(sessionLeft, weeklyLeft);
+
+    let kind;
+    if (bottleneck <= 6) kind = "blocked";
+    else if (bottleneck <= 15) kind = "low";
+    else if (bottleneck <= 30) kind = "watch";
+    else kind = "ready";
+
+    return { kind, score: bottleneck, sessionLeft, weeklyLeft };
+  }
+
+  // Test 1: session 100%, weekly 35% → blocked (session bottleneck = 0%)
+  const r1 = tryBuildFromCache(100, 35, 0);
+  assert.equal(r1.kind, "blocked");
+  assert.equal(r1.score, 0);
+
+  // Test 2: session 10%, weekly 35% → ready (bottleneck = 65%)
+  const r2 = tryBuildFromCache(10, 35, 0);
+  assert.equal(r2.kind, "ready");
+  assert.equal(r2.score, 65);
+  assert.equal(r2.sessionLeft, 90);
+  assert.equal(r2.weeklyLeft, 65);
+
+  // Test 3: session 90%, weekly 50% → low (bottleneck = 10%)
+  const r3 = tryBuildFromCache(90, 50, 0);
+  assert.equal(r3.kind, "low");
+  assert.equal(r3.score, 10);
+
+  // Test 4: stale cache (> 30s) → returns null
+  const r4 = tryBuildFromCache(50, 50, 31_000);
+  assert.equal(r4, null);
+
+  // Test 5: session 75%, weekly 80% → watch (bottleneck = 20%)
+  const r5 = tryBuildFromCache(75, 80, 5_000);
+  assert.equal(r5.kind, "watch");
+  assert.equal(r5.score, 20);
+
+  // Test 6: session 94%, weekly 94% → blocked (bottleneck = 6%)
+  const r6 = tryBuildFromCache(94, 94, 0);
+  assert.equal(r6.kind, "blocked");
+  assert.equal(r6.score, 6);
+
+  // Test 7: session 85%, weekly 85% → low (bottleneck = 15%)
+  const r7 = tryBuildFromCache(85, 85, 0);
+  assert.equal(r7.kind, "low");
+  assert.equal(r7.score, 15);
+
+  console.log("usage-bars cache checks passed");
+}
+
+
 runWindowClassificationChecks();
 runSeverityChecks();
 runLimitsArrayParsingChecks();
@@ -592,4 +651,5 @@ runGoogleGeminiQuotaParsingChecks();
 runGoogleAntigravityQuotaParsingChecks();
 runGoogleClassificationChecks();
 runDisplayNameChecks();
+runUsageBarsCacheChecks();
 console.log("subscription limit checks passed");

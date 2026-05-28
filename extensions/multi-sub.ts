@@ -1479,9 +1479,80 @@ function collectQuotaAccounts(ctx: ExtensionContext): QuotaAccount[] {
 	return accounts;
 }
 
+// ── usage-bars integration cache ──────────────────────────────────────
+// pi-usage-bars emits "usage:update" with { session, weekly } (used-percent 0-100)
+// for the ACTIVE provider on every poll (~2 min). We cache it here so
+// codexQuotaChecker can skip the duplicate API call.
+interface UsageBarsCache {
+	session: number; // used percent 0-100
+	weekly: number;  // used percent 0-100
+	timestamp: number;
+}
+let usageBarsCache: UsageBarsCache | null = null;
+const USAGE_BARS_CACHE_TTL_MS = 30_000; // 30 s
+
+/** Called from multiSub() entry point via pi.events.on("usage:update", ...) */
+function onUsageBarsUpdate(data: unknown): void {
+	const rec = data && typeof data === "object" ? data as Record<string, unknown> : null;
+	if (!rec) return;
+	const session = typeof rec.session === "number" ? rec.session : undefined;
+	const weekly = typeof rec.weekly === "number" ? rec.weekly : undefined;
+	if (session === undefined && weekly === undefined) return;
+	usageBarsCache = {
+		session: session ?? 0,
+		weekly: weekly ?? 0,
+		timestamp: Date.now(),
+	};
+}
+
+function tryBuildFromUsageBarsCache(
+	account: QuotaAccount,
+): QuotaCheckResult | null {
+	if (!usageBarsCache) return null;
+	if (Date.now() - usageBarsCache.timestamp > USAGE_BARS_CACHE_TTL_MS) return null;
+
+	const sessionUsed = usageBarsCache.session;
+	const weeklyUsed = usageBarsCache.weekly;
+	const sessionLeft = Math.max(0, Math.min(100, 100 - sessionUsed));
+	const weeklyLeft = Math.max(0, Math.min(100, 100 - weeklyUsed));
+	const bottleneck = Math.min(sessionLeft, weeklyLeft);
+
+	let kind: QuotaStatusKind;
+	if (bottleneck <= 6) kind = "blocked";
+	else if (bottleneck <= 15) kind = "low";
+	else if (bottleneck <= 30) kind = "watch";
+	else kind = "ready";
+
+	const summary = [
+		`5h ${Math.round(sessionLeft)}% left`,
+		`7d ${Math.round(weeklyLeft)}% left`,
+		formatQuotaKind(kind),
+		"(via usage-bars)",
+	].join(" | ");
+
+	return {
+		account,
+		kind,
+		summary,
+		details: [
+			`account: ${account.displayName}`,
+			`provider: ${account.providerName}`,
+			`status: ${formatQuotaKind(kind)}`,
+			`5-hour window: ${Math.round(sessionLeft)}% left`,
+			`7-day window: ${Math.round(weeklyLeft)}% left`,
+			`source: pi-usage-bars event cache (${Math.round((Date.now() - usageBarsCache.timestamp) / 1000)}s ago)`,
+		],
+		score: bottleneck,
+	};
+}
+
 const codexQuotaChecker: ProviderQuotaChecker = {
 	baseProvider: "openai-codex",
 	async check(account: QuotaAccount, signal?: AbortSignal): Promise<QuotaCheckResult> {
+		// Try using cached data from pi-usage-bars first (avoids duplicate API call)
+		const cached = tryBuildFromUsageBarsCache(account);
+		if (cached) return cached;
+
 		const auth = account.auth;
 		if (!auth || auth.type !== "oauth" || typeof auth.access !== "string" || auth.access.length === 0) {
 			return {
@@ -5821,6 +5892,9 @@ export default function multiSub(pi: ExtensionAPI) {
 	// Initialize pool manager with global pools (updated on session_start with project config)
 	const poolManager = new PoolManager(pi);
 	poolManager.loadPools(config.pools);
+
+	// Subscribe to pi-usage-bars events (if installed) to avoid duplicate API calls
+	pi.events.on("usage:update", onUsageBarsUpdate);
 
 	let projectRestrictionSwitchInFlight = false;
 	const enforceProjectRestriction = async (
