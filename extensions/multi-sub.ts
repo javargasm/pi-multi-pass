@@ -1495,13 +1495,30 @@ const codexQuotaChecker: ProviderQuotaChecker = {
 			};
 		}
 
-		const tokenMetadata = getCodexTokenMetadata(auth.access);
+		let token = auth.access;
+		if (auth.expires && auth.expires - Date.now() < 5 * 60 * 1000) {
+			if (typeof auth.refresh === "string" && auth.refresh.length > 0) {
+				try {
+					const credentials = await refreshOpenAICodexToken(auth.refresh);
+					if (credentials && credentials.access) {
+						token = credentials.access;
+						auth.access = credentials.access;
+						if (credentials.expires) auth.expires = credentials.expires;
+						if (credentials.refresh) auth.refresh = credentials.refresh;
+					}
+				} catch (error) {
+					// Fall back to original access token
+				}
+			}
+		}
+
+		const tokenMetadata = getCodexTokenMetadata(token);
 		const accountId = typeof auth.accountId === "string" && auth.accountId.length > 0
 			? auth.accountId
 			: tokenMetadata.accountId;
 		const baseUrl = (process.env.CHATGPT_BASE_URL || DEFAULT_CODEX_USAGE_BASE_URL).replace(/\/+$/, "");
 		const headers = new Headers({
-			Authorization: `Bearer ${auth.access}`,
+			Authorization: `Bearer ${token}`,
 			Accept: "application/json",
 			"User-Agent": "pi-multi-pass",
 		});
@@ -2766,8 +2783,9 @@ class PoolManager {
 				return true;
 			}
 			if (!shouldRotate && result) {
+				const errorDetail = result.kind === "error" ? ` (error: ${result.summary})` : "";
 				ctx.ui.notify(
-					`[pool:${pool.name}] Proactive check: ${currentModel.provider} quota is ${result.kind} (${Math.round(result.score)}% left); no rotation needed`,
+					`[pool:${pool.name}] Proactive check: ${currentModel.provider} quota is ${result.kind} (${Math.round(result.score)}% left)${errorDetail}; no rotation needed`,
 					"info",
 				);
 			}
