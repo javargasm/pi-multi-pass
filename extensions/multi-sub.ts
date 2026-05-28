@@ -507,6 +507,9 @@ function parseCodexUsageSnapshot(data: unknown): CodexUsageSnapshot {
 			};
 		}
 	}
+	let fiveHour: CodexUsageWindow | undefined = undefined;
+	let weekly: CodexUsageWindow | undefined = undefined;
+
 	// Legacy rate_limit format check with duration-aware matching
 	const rateLimit = getRecord(raw?.rate_limit);
 	if (rateLimit) {
