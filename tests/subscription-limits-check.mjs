@@ -2,10 +2,14 @@ import assert from "node:assert/strict";
 
 function normalizeCodexUsageWindow(window) {
   if (!window || typeof window !== "object" || Array.isArray(window)) return undefined;
+  let resetAt = typeof window.reset_at === "number" ? window.reset_at : undefined;
+  if (resetAt === undefined && typeof window.reset_after_seconds === "number") {
+    resetAt = Math.floor(Date.now() / 1000) + window.reset_after_seconds;
+  }
   return {
     usedPercent: typeof window.used_percent === "number" ? window.used_percent : 0,
     windowSeconds: typeof window.limit_window_seconds === "number" ? window.limit_window_seconds : 0,
-    resetAt: typeof window.reset_at === "number" ? window.reset_at : undefined,
+    resetAt,
   };
 }
 
@@ -14,17 +18,230 @@ function matchesUsageWindow(window, expectedSeconds) {
   return Math.abs(window.windowSeconds - expectedSeconds) <= 120;
 }
 
+function normalizePercent(val) {
+  if (typeof val === "number" && Number.isFinite(val)) {
+    if (val > 0 && val < 1 && !Number.isInteger(val)) return val * 100;
+    if (val >= 0 && val <= 100) return val;
+  }
+  return undefined;
+}
+
+function findPercentCandidate(values) {
+  for (const val of values) {
+    const norm = normalizePercent(val);
+    if (norm !== undefined) return norm;
+  }
+  return undefined;
+}
+
+function findResetAtCandidate(absoluteCandidates, relativeSecondsCandidates) {
+  for (const val of absoluteCandidates) {
+    if (typeof val === "number" && Number.isFinite(val) && val > 0) {
+      return val;
+    }
+    if (typeof val === "string") {
+      const parsed = Date.parse(val);
+      if (Number.isFinite(parsed)) {
+        return Math.floor(parsed / 1000);
+      }
+    }
+  }
+  for (const val of relativeSecondsCandidates) {
+    if (typeof val === "number" && Number.isFinite(val) && val >= 0) {
+      return Math.floor(Date.now() / 1000) + val;
+    }
+  }
+  return undefined;
+}
+
+function getRecord(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  return value;
+}
+
 function parseCodexUsageSnapshot(data) {
-  const rateLimit = data?.rate_limit || {};
-  const windows = [
-    normalizeCodexUsageWindow(rateLimit.primary_window),
-    normalizeCodexUsageWindow(rateLimit.secondary_window),
-  ].filter(Boolean);
+  const raw = getRecord(data);
+
+  // Try limits[] array format first
+  const limitArrays = [raw?.data?.limits, raw?.limits, raw?.quota?.limits, raw?.data?.quota?.limits];
+  const limits = limitArrays.find((arr) => Array.isArray(arr));
+  if (limits) {
+    const SESSION_TYPES = new Set(["TIME_LIMIT", "SESSION_LIMIT", "REQUEST_LIMIT", "RPM_LIMIT", "RPD_LIMIT"]);
+    const WEEKLY_TYPES = new Set(["TOKENS_LIMIT", "TOKEN_LIMIT", "WEEK_LIMIT", "WEEKLY_LIMIT", "TPM_LIMIT", "DAILY_LIMIT"]);
+    const sessionEntry = limits.find((l) => SESSION_TYPES.has(String(l?.type || "").toUpperCase()));
+    const weeklyEntry = limits.find((l) => WEEKLY_TYPES.has(String(l?.type || "").toUpperCase()));
+
+    const readLimitPercent = (entry) => {
+      if (!entry) return undefined;
+      for (const key of ["percentage", "utilization", "used_percent", "usedPercent"]) {
+        const val = entry[key];
+        if (typeof val === "number" && Number.isFinite(val)) {
+          if (val > 0 && val < 1 && !Number.isInteger(val)) return val * 100;
+          if (val >= 0 && val <= 100) return val;
+        }
+      }
+      const current = typeof entry.currentValue === "number" ? entry.currentValue : undefined;
+      const remaining = typeof entry.remaining === "number" ? entry.remaining : undefined;
+      if (current !== undefined && remaining !== undefined && current + remaining > 0) {
+        return (current / (current + remaining)) * 100;
+      }
+      return undefined;
+    };
+
+    const sessionPct = readLimitPercent(sessionEntry);
+    const weeklyPct = readLimitPercent(weeklyEntry);
+
+    if (sessionPct !== undefined || weeklyPct !== undefined) {
+      const sessionResetAt = findResetAtCandidate(
+        [sessionEntry?.resetAt, sessionEntry?.reset_at],
+        [sessionEntry?.resetAfterSeconds, sessionEntry?.reset_after_seconds]
+      );
+      const weeklyResetAt = findResetAtCandidate(
+        [weeklyEntry?.resetAt, weeklyEntry?.reset_at],
+        [weeklyEntry?.resetAfterSeconds, weeklyEntry?.reset_after_seconds]
+      );
+
+      const fiveHour = sessionPct !== undefined
+        ? { usedPercent: sessionPct, windowSeconds: 5 * 60 * 60, resetAt: sessionResetAt }
+        : undefined;
+      const weekly = weeklyPct !== undefined
+        ? { usedPercent: weeklyPct, windowSeconds: 7 * 24 * 60 * 60, resetAt: weeklyResetAt }
+        : undefined;
+      return {
+        planType: typeof raw?.plan_type === "string" ? raw.plan_type : "unknown",
+        email: typeof raw?.email === "string" ? raw.email : "",
+        fiveHour,
+        weekly,
+      };
+    }
+  }
+
+  let fiveHour = undefined;
+  let weekly = undefined;
+
+  // Legacy rate_limit format check with duration-aware matching
+  const rateLimit = getRecord(raw?.rate_limit);
+  if (rateLimit) {
+    const primary = normalizeCodexUsageWindow(rateLimit.primary_window);
+    const secondary = normalizeCodexUsageWindow(rateLimit.secondary_window);
+
+    if (primary || secondary) {
+      const candidateWindows = [primary, secondary].filter((w) => Boolean(w));
+      const matchedSession = candidateWindows.find((w) => w.windowSeconds > 0 && w.windowSeconds <= 12 * 60 * 60);
+      const matchedWeekly = candidateWindows.find((w) => w.windowSeconds > 12 * 60 * 60);
+
+      if (matchedSession) {
+        fiveHour = matchedSession;
+      }
+      if (matchedWeekly) {
+        weekly = matchedWeekly;
+      }
+
+      if (!fiveHour && !weekly) {
+        if (primary) {
+          fiveHour = { ...primary, windowSeconds: primary.windowSeconds || 5 * 60 * 60 };
+        }
+        if (secondary) {
+          weekly = { ...secondary, windowSeconds: secondary.windowSeconds || 7 * 24 * 60 * 60 };
+        }
+      } else {
+        if (fiveHour && !weekly) {
+          const remaining = candidateWindows.find((w) => w !== fiveHour);
+          if (remaining) {
+            weekly = { ...remaining, windowSeconds: remaining.windowSeconds || 7 * 24 * 60 * 60 };
+          }
+        } else if (weekly && !fiveHour) {
+          const remaining = candidateWindows.find((w) => w !== weekly);
+          if (remaining) {
+            fiveHour = { ...remaining, windowSeconds: remaining.windowSeconds || 5 * 60 * 60 };
+          }
+        }
+      }
+    }
+  }
+
+  // Fallback to flat candidates if still missing
+  if (!fiveHour) {
+    const sessionPct = findPercentCandidate([
+      raw?.session,
+      raw?.sessionPercent,
+      raw?.session_percent,
+      raw?.five_hour?.utilization,
+      raw?.five_hour?.used_percent,
+      raw?.limits?.session?.utilization,
+      raw?.usage?.session,
+      raw?.data?.session,
+      raw?.data?.sessionPercent,
+      raw?.data?.session_percent,
+      raw?.data?.usage?.session,
+      raw?.quota?.session?.percentage,
+      raw?.data?.quota?.session?.percentage,
+    ]);
+    if (sessionPct !== undefined) {
+      const sessionResetAt = findResetAtCandidate(
+        [
+          raw?.five_hour?.reset_at,
+          raw?.sessionResetAt,
+        ],
+        [
+          raw?.five_hour?.reset_after_seconds,
+        ]
+      );
+      const sessionWindowSecs = typeof raw?.five_hour?.window_seconds === "number"
+        ? raw.five_hour.window_seconds
+        : 5 * 60 * 60;
+      fiveHour = {
+        usedPercent: sessionPct,
+        windowSeconds: sessionWindowSecs,
+        resetAt: sessionResetAt,
+      };
+    }
+  }
+
+  if (!weekly) {
+    const weeklyPct = findPercentCandidate([
+      raw?.weekly,
+      raw?.weeklyPercent,
+      raw?.weekly_percent,
+      raw?.seven_day?.utilization,
+      raw?.seven_day?.used_percent,
+      raw?.limits?.weekly?.utilization,
+      raw?.usage?.weekly,
+      raw?.data?.weekly,
+      raw?.data?.weeklyPercent,
+      raw?.data?.weekly_percent,
+      raw?.data?.usage?.weekly,
+      raw?.quota?.weekly?.percentage,
+      raw?.data?.quota?.weekly?.percentage,
+      raw?.quota?.daily?.percentage,
+      raw?.data?.quota?.daily?.percentage,
+    ]);
+    if (weeklyPct !== undefined) {
+      const weeklyResetAt = findResetAtCandidate(
+        [
+          raw?.seven_day?.reset_at,
+          raw?.weeklyResetAt,
+        ],
+        [
+          raw?.seven_day?.reset_after_seconds,
+        ]
+      );
+      const weeklyWindowSecs = typeof raw?.seven_day?.window_seconds === "number"
+        ? raw.seven_day.window_seconds
+        : 7 * 24 * 60 * 60;
+      weekly = {
+        usedPercent: weeklyPct,
+        windowSeconds: weeklyWindowSecs,
+        resetAt: weeklyResetAt,
+      };
+    }
+  }
+
   return {
-    planType: typeof data?.plan_type === "string" ? data.plan_type : "unknown",
-    email: typeof data?.email === "string" ? data.email : "",
-    fiveHour: windows.find((window) => matchesUsageWindow(window, 5 * 60 * 60)),
-    weekly: windows.find((window) => matchesUsageWindow(window, 7 * 24 * 60 * 60)),
+    planType: typeof raw?.plan_type === "string" ? raw.plan_type : "unknown",
+    email: typeof raw?.email === "string" ? raw.email : "",
+    fiveHour,
+    weekly,
   };
 }
 
@@ -38,7 +255,7 @@ function classifyCodexQuotaKind(snapshot) {
     .filter((value) => value !== undefined);
   if (values.length === 0) return { kind: "error", score: 0 };
   const bottleneck = Math.min(...values);
-  if (bottleneck <= 5) return { kind: "blocked", score: bottleneck };
+  if (bottleneck <= 6) return { kind: "blocked", score: bottleneck };
   if (bottleneck <= 15) return { kind: "low", score: bottleneck };
   if (bottleneck <= 30) return { kind: "watch", score: bottleneck };
   return { kind: "ready", score: bottleneck };
@@ -308,8 +525,69 @@ function runDisplayNameChecks() {
   );
 }
 
+function runLimitsArrayParsingChecks() {
+  // Test 1: limits[] array with TIME_LIMIT + TOKENS_LIMIT
+  const snapshot1 = parseCodexUsageSnapshot({
+    plan_type: "plus",
+    limits: [
+      { type: "TIME_LIMIT", percentage: 99 },
+      { type: "TOKENS_LIMIT", percentage: 33 },
+    ],
+  });
+  assert.equal(snapshot1.planType, "plus");
+  assert.ok(snapshot1.fiveHour, "Should parse session from TIME_LIMIT");
+  assert.equal(snapshot1.fiveHour.usedPercent, 99);
+  assert.ok(snapshot1.weekly, "Should parse weekly from TOKENS_LIMIT");
+  assert.equal(snapshot1.weekly.usedPercent, 33);
+
+  const kind1 = classifyCodexQuotaKind(snapshot1);
+  assert.equal(kind1.kind, "blocked", "1% remaining should be blocked");
+  assert.equal(kind1.score, 1);
+
+  // Test 2: limits[] inside data.data.limits
+  const snapshot2 = parseCodexUsageSnapshot({
+    data: {
+      limits: [
+        { type: "SESSION_LIMIT", utilization: 0.85 },
+        { type: "WEEKLY_LIMIT", utilization: 0.40 },
+      ],
+    },
+  });
+  assert.ok(snapshot2.fiveHour, "Should parse session from data.data.limits");
+  assert.equal(snapshot2.fiveHour.usedPercent, 85);
+  assert.ok(snapshot2.weekly);
+  assert.equal(snapshot2.weekly.usedPercent, 40);
+
+  // Test 3: limits[] with currentValue/remaining fallback
+  const snapshot3 = parseCodexUsageSnapshot({
+    limits: [
+      { type: "REQUEST_LIMIT", currentValue: 80, remaining: 20 },
+      { type: "WEEK_LIMIT", currentValue: 30, remaining: 70 },
+    ],
+  });
+  assert.ok(snapshot3.fiveHour);
+  assert.equal(snapshot3.fiveHour.usedPercent, 80);
+  assert.ok(snapshot3.weekly);
+  assert.equal(snapshot3.weekly.usedPercent, 30);
+
+  // Test 4: No limits[] → falls back to legacy format
+  const snapshot4 = parseCodexUsageSnapshot({
+    rate_limit: {
+      primary_window: { used_percent: 50, limit_window_seconds: 5 * 60 * 60 },
+      secondary_window: { used_percent: 25, limit_window_seconds: 7 * 24 * 60 * 60 },
+    },
+  });
+  assert.ok(snapshot4.fiveHour, "Should fall back to legacy format");
+  assert.equal(snapshot4.fiveHour.usedPercent, 50);
+  assert.ok(snapshot4.weekly);
+  assert.equal(snapshot4.weekly.usedPercent, 25);
+
+  console.log("limits-array parsing checks passed");
+}
+
 runWindowClassificationChecks();
 runSeverityChecks();
+runLimitsArrayParsingChecks();
 runGoogleGeminiQuotaParsingChecks();
 runGoogleAntigravityQuotaParsingChecks();
 runGoogleClassificationChecks();

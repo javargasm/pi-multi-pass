@@ -390,7 +390,10 @@ function normalizeCodexUsageWindow(window: unknown): CodexUsageWindow | undefine
 	if (!raw) return undefined;
 	const usedPercent = typeof raw.used_percent === "number" ? raw.used_percent : 0;
 	const windowSeconds = typeof raw.limit_window_seconds === "number" ? raw.limit_window_seconds : 0;
-	const resetAt = typeof raw.reset_at === "number" ? raw.reset_at : undefined;
+	let resetAt = typeof raw.reset_at === "number" ? raw.reset_at : undefined;
+	if (resetAt === undefined && typeof raw.reset_after_seconds === "number") {
+		resetAt = Math.floor(Date.now() / 1000) + raw.reset_after_seconds;
+	}
 	return {
 		usedPercent,
 		windowSeconds,
@@ -403,15 +406,225 @@ function matchesUsageWindow(window: CodexUsageWindow | undefined, expectedSecond
 	return Math.abs(window.windowSeconds - expectedSeconds) <= 120;
 }
 
+function normalizePercent(val: unknown): number | undefined {
+	if (typeof val === "number" && Number.isFinite(val)) {
+		if (val > 0 && val < 1 && !Number.isInteger(val)) return val * 100;
+		if (val >= 0 && val <= 100) return val;
+	}
+	return undefined;
+}
+
+function findPercentCandidate(values: unknown[]): number | undefined {
+	for (const val of values) {
+		const norm = normalizePercent(val);
+		if (norm !== undefined) return norm;
+	}
+	return undefined;
+}
+
+function findResetAtCandidate(absoluteCandidates: unknown[], relativeSecondsCandidates: unknown[]): number | undefined {
+	for (const val of absoluteCandidates) {
+		if (typeof val === "number" && Number.isFinite(val) && val > 0) {
+			return val;
+		}
+		if (typeof val === "string") {
+			const parsed = Date.parse(val);
+			if (Number.isFinite(parsed)) {
+				return Math.floor(parsed / 1000);
+			}
+		}
+	}
+	for (const val of relativeSecondsCandidates) {
+		if (typeof val === "number" && Number.isFinite(val) && val >= 0) {
+			return Math.floor(Date.now() / 1000) + val;
+		}
+	}
+	return undefined;
+}
+
 function parseCodexUsageSnapshot(data: unknown): CodexUsageSnapshot {
 	const raw = getRecord(data);
+
+	// Try limits[] array format first (newer API shape used by some Codex endpoints).
+	// Session types: TIME_LIMIT, SESSION_LIMIT, REQUEST_LIMIT, RPM_LIMIT, RPD_LIMIT
+	// Weekly types: TOKENS_LIMIT, TOKEN_LIMIT, WEEK_LIMIT, WEEKLY_LIMIT, TPM_LIMIT, DAILY_LIMIT
+	const limitArrays = [
+		(raw?.data as any)?.limits,
+		(raw as any)?.limits,
+		(raw?.quota as any)?.limits,
+		(raw?.data as any)?.quota?.limits,
+	];
+	const limits = limitArrays.find((arr) => Array.isArray(arr)) as Record<string, unknown>[] | undefined;
+	if (limits) {
+		const SESSION_TYPES = new Set(["TIME_LIMIT", "SESSION_LIMIT", "REQUEST_LIMIT", "RPM_LIMIT", "RPD_LIMIT"]);
+		const WEEKLY_TYPES = new Set(["TOKENS_LIMIT", "TOKEN_LIMIT", "WEEK_LIMIT", "WEEKLY_LIMIT", "TPM_LIMIT", "DAILY_LIMIT"]);
+		const sessionEntry = limits.find((l) => SESSION_TYPES.has(String(l?.type || "").toUpperCase()));
+		const weeklyEntry = limits.find((l) => WEEKLY_TYPES.has(String(l?.type || "").toUpperCase()));
+
+		const readLimitPercent = (entry: Record<string, unknown> | undefined): number | undefined => {
+			if (!entry) return undefined;
+			for (const key of ["percentage", "utilization", "used_percent", "usedPercent"]) {
+				const val = entry[key];
+				if (typeof val === "number" && Number.isFinite(val)) {
+					// Normalize: values in 0-1 range (exclusive of integers) → multiply by 100
+					if (val > 0 && val < 1 && !Number.isInteger(val)) return val * 100;
+					if (val >= 0 && val <= 100) return val;
+				}
+			}
+			// Fallback: compute from currentValue + remaining
+			const current = typeof entry.currentValue === "number" ? entry.currentValue : undefined;
+			const remaining = typeof entry.remaining === "number" ? entry.remaining : undefined;
+			if (current !== undefined && remaining !== undefined && current + remaining > 0) {
+				return (current / (current + remaining)) * 100;
+			}
+			return undefined;
+		};
+
+		const sessionPct = readLimitPercent(sessionEntry);
+		const weeklyPct = readLimitPercent(weeklyEntry);
+
+		if (sessionPct !== undefined || weeklyPct !== undefined) {
+			const sessionResetAt = findResetAtCandidate(
+				[sessionEntry?.resetAt, sessionEntry?.reset_at],
+				[sessionEntry?.resetAfterSeconds, sessionEntry?.reset_after_seconds]
+			);
+			const weeklyResetAt = findResetAtCandidate(
+				[weeklyEntry?.resetAt, weeklyEntry?.reset_at],
+				[weeklyEntry?.resetAfterSeconds, weeklyEntry?.reset_after_seconds]
+			);
+
+			const fiveHour: CodexUsageWindow | undefined = sessionPct !== undefined
+				? { usedPercent: sessionPct, windowSeconds: 5 * 60 * 60, resetAt: sessionResetAt }
+				: undefined;
+			const weekly: CodexUsageWindow | undefined = weeklyPct !== undefined
+				? { usedPercent: weeklyPct, windowSeconds: 7 * 24 * 60 * 60, resetAt: weeklyResetAt }
+				: undefined;
+			return {
+				planType: typeof raw?.plan_type === "string" ? raw.plan_type : "unknown",
+				email: typeof raw?.email === "string" ? raw.email : "",
+				fiveHour,
+				weekly,
+			};
+		}
+	}
+	// Legacy rate_limit format check with duration-aware matching
 	const rateLimit = getRecord(raw?.rate_limit);
-	const windows = [
-		normalizeCodexUsageWindow(rateLimit?.primary_window),
-		normalizeCodexUsageWindow(rateLimit?.secondary_window),
-	].filter((window): window is CodexUsageWindow => Boolean(window));
-	const fiveHour = windows.find((window) => matchesUsageWindow(window, 5 * 60 * 60));
-	const weekly = windows.find((window) => matchesUsageWindow(window, 7 * 24 * 60 * 60));
+	if (rateLimit) {
+		const primary = normalizeCodexUsageWindow(rateLimit.primary_window);
+		const secondary = normalizeCodexUsageWindow(rateLimit.secondary_window);
+
+		if (primary || secondary) {
+			const candidateWindows = [primary, secondary].filter((w): w is CodexUsageWindow => Boolean(w));
+			const matchedSession = candidateWindows.find((w) => w.windowSeconds > 0 && w.windowSeconds <= 12 * 60 * 60);
+			const matchedWeekly = candidateWindows.find((w) => w.windowSeconds > 12 * 60 * 60);
+
+			if (matchedSession) {
+				fiveHour = matchedSession;
+			}
+			if (matchedWeekly) {
+				weekly = matchedWeekly;
+			}
+
+			if (!fiveHour && !weekly) {
+				if (primary) {
+					fiveHour = { ...primary, windowSeconds: primary.windowSeconds || 5 * 60 * 60 };
+				}
+				if (secondary) {
+					weekly = { ...secondary, windowSeconds: secondary.windowSeconds || 7 * 24 * 60 * 60 };
+				}
+			} else {
+				if (fiveHour && !weekly) {
+					const remaining = candidateWindows.find((w) => w !== fiveHour);
+					if (remaining) {
+						weekly = { ...remaining, windowSeconds: remaining.windowSeconds || 7 * 24 * 60 * 60 };
+					}
+				} else if (weekly && !fiveHour) {
+					const remaining = candidateWindows.find((w) => w !== weekly);
+					if (remaining) {
+						fiveHour = { ...remaining, windowSeconds: remaining.windowSeconds || 5 * 60 * 60 };
+					}
+				}
+			}
+		}
+	}
+
+	// Fallback to flat candidates if still missing
+	if (!fiveHour) {
+		const sessionPct = findPercentCandidate([
+			raw?.session,
+			raw?.sessionPercent,
+			raw?.session_percent,
+			(raw as any)?.five_hour?.utilization,
+			(raw as any)?.five_hour?.used_percent,
+			(raw as any)?.limits?.session?.utilization,
+			(raw as any)?.usage?.session,
+			(raw?.data as any)?.session,
+			(raw?.data as any)?.sessionPercent,
+			(raw?.data as any)?.session_percent,
+			(raw?.data as any)?.usage?.session,
+			(raw?.quota as any)?.session?.percentage,
+			(raw?.data as any)?.quota?.session?.percentage,
+		]);
+		if (sessionPct !== undefined) {
+			const sessionResetAt = findResetAtCandidate(
+				[
+					(raw as any)?.five_hour?.reset_at,
+					(raw as any)?.sessionResetAt,
+				],
+				[
+					(raw as any)?.five_hour?.reset_after_seconds,
+				]
+			);
+			const sessionWindowSecs = typeof (raw as any)?.five_hour?.window_seconds === "number"
+				? (raw as any).five_hour.window_seconds
+				: 5 * 60 * 60;
+			fiveHour = {
+				usedPercent: sessionPct,
+				windowSeconds: sessionWindowSecs,
+				resetAt: sessionResetAt,
+			};
+		}
+	}
+
+	if (!weekly) {
+		const weeklyPct = findPercentCandidate([
+			raw?.weekly,
+			raw?.weeklyPercent,
+			raw?.weekly_percent,
+			(raw as any)?.seven_day?.utilization,
+			(raw as any)?.seven_day?.used_percent,
+			(raw as any)?.limits?.weekly?.utilization,
+			(raw as any)?.usage?.weekly,
+			(raw?.data as any)?.weekly,
+			(raw?.data as any)?.weeklyPercent,
+			(raw?.data as any)?.weekly_percent,
+			(raw?.data as any)?.usage?.weekly,
+			(raw?.quota as any)?.weekly?.percentage,
+			(raw?.data as any)?.quota?.weekly?.percentage,
+			(raw?.quota as any)?.daily?.percentage,
+			(raw?.data as any)?.quota?.daily?.percentage,
+		]);
+		if (weeklyPct !== undefined) {
+			const weeklyResetAt = findResetAtCandidate(
+				[
+					(raw as any)?.seven_day?.reset_at,
+					(raw as any)?.weeklyResetAt,
+				],
+				[
+					(raw as any)?.seven_day?.reset_after_seconds,
+				]
+			);
+			const weeklyWindowSecs = typeof (raw as any)?.seven_day?.window_seconds === "number"
+				? (raw as any).seven_day.window_seconds
+				: 7 * 24 * 60 * 60;
+			weekly = {
+				usedPercent: weeklyPct,
+				windowSeconds: weeklyWindowSecs,
+				resetAt: weeklyResetAt,
+			};
+		}
+	}
+
 	return {
 		planType: typeof raw?.plan_type === "string" ? raw.plan_type : "unknown",
 		email: typeof raw?.email === "string" ? raw.email : "",
@@ -499,7 +712,7 @@ function classifyCodexQuotaKind(snapshot: CodexUsageSnapshot): {
 		return { kind: "error", score: 0 };
 	}
 	const bottleneck = Math.min(...values);
-	if (bottleneck <= 5) return { kind: "blocked", score: bottleneck };
+	if (bottleneck <= 6) return { kind: "blocked", score: bottleneck };
 	if (bottleneck <= 15) return { kind: "low", score: bottleneck };
 	if (bottleneck <= 30) return { kind: "watch", score: bottleneck };
 	return { kind: "ready", score: bottleneck };
@@ -977,7 +1190,7 @@ function classifyGoogleQuotaKind(snapshot: GoogleQuotaAccountSnapshot): {
 	if (bottleneck === undefined) {
 		return { kind: "error", score: 0 };
 	}
-	if (bottleneck <= 5) return { kind: "blocked", score: bottleneck };
+	if (bottleneck <= 6) return { kind: "blocked", score: bottleneck };
 	if (bottleneck <= 15) return { kind: "low", score: bottleneck };
 	if (bottleneck <= 30) return { kind: "watch", score: bottleneck };
 	return { kind: "ready", score: bottleneck };
@@ -1540,6 +1753,9 @@ interface PoolConfig {
 	/** Selection strategy when picking the next member on failover.
 	 *  Defaults to "round-robin" when omitted. */
 	strategy?: PoolStrategy;
+	/** Minimum quota status that triggers proactive rotation before a turn.
+	 *  Defaults to "low" (≤15% remaining). Set to "blocked" for ≤5% only. */
+	proactiveThreshold?: "low" | "blocked";
 	/** Per-member schedule rules (keyed by provider name).
 	 *  Only used when strategy is "scheduled". */
 	memberSchedule?: Record<string, MemberSchedule>;
@@ -2283,6 +2499,7 @@ class PoolManager {
 	): FailoverPlan {
 		const attemptedProviders = options?.attemptedProviders ?? new Set<string>();
 		const visitedChainIndexes = options?.visitedChainIndexes ?? new Set<number>();
+		const skipLowQuota = options?.skipLowQuota ?? false;
 		const pool = this.getPoolForProvider(currentModel.provider);
 		if (!pool) {
 			return { candidates: [], skips: [] };
@@ -2313,6 +2530,7 @@ class PoolManager {
 				candidate,
 				authStorage,
 				this.isMemberExhausted(pool, candidate),
+				skipLowQuota,
 			);
 			if (skip) {
 				skips.push(skip);
@@ -2379,6 +2597,7 @@ class PoolManager {
 					member,
 					authStorage,
 					this.isMemberExhausted(targetPool, member),
+					skipLowQuota,
 				);
 				if (memberSkip) {
 					skips.push({
@@ -2445,10 +2664,15 @@ class PoolManager {
 		};
 
 		try {
-			const [result] = await runQuotaChecks([account]);
-			if (result && result.kind === "blocked") {
+			const [result] = await runQuotaChecks([account], undefined, true);
+			const threshold = pool.proactiveThreshold ?? "low";
+			const shouldRotate = result && (
+				result.kind === "blocked" ||
+				(threshold === "low" && result.kind === "low")
+			);
+			if (shouldRotate) {
 				ctx.ui.notify(
-					`[pool:${pool.name}] Proactive rotation: ${currentModel.provider} is at <= 5% quota. Switching...`,
+					`[pool:${pool.name}] Proactive rotation: ${currentModel.provider} quota is ${result.kind} (${Math.round(result.score)}% left). Switching...`,
 					"info",
 				);
 				this.markExhausted(currentModel.provider);
@@ -2465,6 +2689,7 @@ class PoolManager {
 					{
 						attemptedProviders: new Set([currentModel.provider]),
 						visitedChainIndexes: new Set<number>(),
+						skipLowQuota: true,
 					},
 				);
 
@@ -2482,6 +2707,29 @@ class PoolManager {
 					cascade,
 					null,
 				);
+
+				// Verify top candidate isn't also low on quota
+				if (plan.candidates.length > 0) {
+					const topCandidate = plan.candidates[0];
+					const topAccount: QuotaAccount = {
+						providerName: topCandidate.provider,
+						baseProvider: getBaseProvider(topCandidate.provider) || topCandidate.provider,
+						displayName: topCandidate.provider,
+						auth: ctx.modelRegistry.authStorage.get(topCandidate.provider) as AuthStorageEntry | undefined,
+					};
+					try {
+						const [topResult] = await runQuotaChecks([topAccount], undefined, true);
+						if (topResult && (topResult.kind === "blocked" || topResult.kind === "low")) {
+							plan.candidates.shift();
+							ctx.ui.notify(
+								`[pool:${pool.name}] Skipping ${topCandidate.provider} (also ${topResult.kind}); trying next`,
+								"info",
+							);
+						}
+					} catch {
+						// Quota check failed for target — proceed with it anyway
+					}
+				}
 
 				const nextCandidate = plan.candidates[0];
 				if (!nextCandidate) {
@@ -2517,8 +2765,24 @@ class PoolManager {
 				ctx.ui.setStatus("multi-pass", formatFailoverStatus(nextCandidate));
 				return true;
 			}
+			if (!shouldRotate && result) {
+				ctx.ui.notify(
+					`[pool:${pool.name}] Proactive check: ${currentModel.provider} quota is ${result.kind} (${Math.round(result.score)}% left); no rotation needed`,
+					"info",
+				);
+			}
+			if (!result) {
+				ctx.ui.notify(
+					`[pool:${pool.name}] Proactive check: no quota data returned for ${currentModel.provider} (baseProvider: ${account.baseProvider})`,
+					"warning",
+				);
+			}
 		} catch (error) {
-			// Don't crash or block user message execution on quota check failure
+			const message = error instanceof Error ? error.message : String(error);
+			ctx.ui.notify(
+				`[pool:${pool.name}] Proactive quota check failed for ${currentModel.provider}: ${message}`,
+				"warning",
+			);
 		}
 
 		return false;
@@ -4460,6 +4724,9 @@ interface FailoverSkip {
 interface FailoverPlanOptions {
 	attemptedProviders?: Set<string>;
 	visitedChainIndexes?: Set<number>;
+	/** When true, skip pool members with cached quota status of "low" or "blocked".
+	 *  Used during proactive rotation to avoid rotating to another low-quota member. */
+	skipLowQuota?: boolean;
 }
 
 interface FailoverPlan {
@@ -4529,6 +4796,7 @@ function classifyPoolMemberSkip(
 	provider: string,
 	authStorage: { hasAuth(provider: string): boolean },
 	exhausted: boolean,
+	skipLowQuota = false,
 ): FailoverSkip | null {
 	if (!authStorage.hasAuth(provider)) {
 		return {
@@ -4547,12 +4815,16 @@ function classifyPoolMemberSkip(
 		};
 	}
 	const cached = quotaCache.get(provider);
-	if (cached && cached.result.kind === "blocked") {
+	const isQuotaExhausted = cached && (
+		cached.result.kind === "blocked" ||
+		(skipLowQuota && cached.result.kind === "low")
+	);
+	if (isQuotaExhausted) {
 		return {
 			type: "pool-member",
 			poolName,
 			reason: "exhausted",
-			detail: `${provider} skipped (quota <= 5%)`,
+			detail: `${provider} skipped (quota ${cached.result.kind})`,
 		};
 	}
 	return null;
@@ -5625,46 +5897,50 @@ export default function multiSub(pi: ExtensionAPI) {
 
 	// Listen for errors to trigger pool rotation
 	pi.on("agent_end", async (event: AgentEndEvent, ctx: ExtensionContext) => {
-		if (!event.messages || event.messages.length === 0) return;
-
-		const lastMsg = event.messages[event.messages.length - 1];
-		if (!lastMsg || lastMsg.role !== "assistant") return;
-
-		const assistantMsg = lastMsg as any;
-		if (assistantMsg.stopReason !== "error") return;
-		if (!assistantMsg.errorMessage) return;
-
-		const effective = loadEffectiveConfig(ctx.cwd);
-		const rotated = await poolManager.handleError(
-			assistantMsg.errorMessage,
-			ctx.model,
-			ctx,
-			lastUserPrompt,
-			normalizeMultiPassConfig({
-				subscriptions: effective.subscriptions,
-				pools: effective.pools,
-				chains: effective.chains,
-				presets: effective.presets,
-			}),
-		);
-
-		if (!rotated && isRateLimitError(assistantMsg.errorMessage)) {
-			const pool = ctx.model
-				? poolManager.getPoolForProvider(ctx.model.provider)
-				: undefined;
-			if (pool) {
-				const available = poolManager.getAvailableMembers(
-					pool,
-					ctx.modelRegistry.authStorage,
-				);
-				if (available.length === 0) {
-					ctx.ui.notify(
-						`[pool:${pool.name}] All members rate limited. Try again in a few minutes.`,
-						"warning",
+		if (event.messages && event.messages.length > 0) {
+			const lastMsg = event.messages[event.messages.length - 1];
+			if (lastMsg && lastMsg.role === "assistant") {
+				const assistantMsg = lastMsg as any;
+				if (assistantMsg.stopReason === "error" && assistantMsg.errorMessage) {
+					const effective = loadEffectiveConfig(ctx.cwd);
+					const rotated = await poolManager.handleError(
+						assistantMsg.errorMessage,
+						ctx.model,
+						ctx,
+						lastUserPrompt,
+						normalizeMultiPassConfig({
+							subscriptions: effective.subscriptions,
+							pools: effective.pools,
+							chains: effective.chains,
+							presets: effective.presets,
+						}),
 					);
+
+					if (!rotated && isRateLimitError(assistantMsg.errorMessage)) {
+						const pool = ctx.model
+							? poolManager.getPoolForProvider(ctx.model.provider)
+							: undefined;
+						if (pool) {
+							const available = poolManager.getAvailableMembers(
+								pool,
+								ctx.modelRegistry.authStorage,
+							);
+							if (available.length === 0) {
+								ctx.ui.notify(
+									`[pool:${pool.name}] All members rate limited. Try again in a few minutes.`,
+									"warning",
+								);
+							}
+						}
+					}
+					return;
 				}
 			}
 		}
+
+		// Post-turn proactive check: catch quota depletion during successful turns
+		// so the next turn starts with a healthy provider already selected.
+		await poolManager.enforceProactiveRotation(ctx);
 	});
 
 	// Register /subs command

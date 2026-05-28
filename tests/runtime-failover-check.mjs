@@ -14,7 +14,7 @@ function getChainEntryIssue(entry, config, modelRegistry) {
   return null;
 }
 
-function classifyPoolMemberSkip(poolName, provider, authStorage, exhausted) {
+function classifyPoolMemberSkip(poolName, provider, authStorage, exhausted, skipLowQuota = false) {
   if (!authStorage.hasAuth(provider)) {
     return {
       type: "pool-member",
@@ -31,8 +31,24 @@ function classifyPoolMemberSkip(poolName, provider, authStorage, exhausted) {
       detail: `${provider} skipped (cooldown active)`,
     };
   }
+  const cached = _quotaCacheMock.get(provider);
+  const isQuotaExhausted = cached && (
+    cached.kind === "blocked" ||
+    (skipLowQuota && cached.kind === "low")
+  );
+  if (isQuotaExhausted) {
+    return {
+      type: "pool-member",
+      poolName,
+      reason: "exhausted",
+      detail: `${provider} skipped (quota ${cached.kind})`,
+    };
+  }
   return null;
 }
+
+// Mock quota cache for testing classifyPoolMemberSkip with skipLowQuota
+const _quotaCacheMock = new Map();
 
 function classifyChainEntrySkip(chain, chainIndex, entry, config) {
   if (!entry.enabled) {
@@ -185,9 +201,10 @@ class RuntimeHarness {
     return this.cascadeState;
   }
 
-  buildFailoverPlan(currentModel) {
+  buildFailoverPlan(currentModel, options) {
     const attemptedProviders = this.cascadeState?.attemptedProviders || new Set();
     const visitedChainIndexes = this.cascadeState?.visitedChainIndexes || new Set();
+    const skipLowQuota = options?.skipLowQuota ?? false;
     const pool = this.getPoolForProvider(currentModel.provider);
     if (!pool) return { candidates: [], skips: [] };
 
@@ -214,6 +231,7 @@ class RuntimeHarness {
         candidate,
         this.authStorage,
         this.isMemberExhausted(pool, candidate),
+        skipLowQuota,
       );
       if (skip) {
         skips.push(skip);
@@ -269,6 +287,7 @@ class RuntimeHarness {
           member,
           this.authStorage,
           this.isMemberExhausted(targetPool, member),
+          skipLowQuota,
         );
         if (memberSkip) {
           skips.push({ ...memberSkip, chainName: applicable.chain.name, chainIndex });
@@ -338,7 +357,7 @@ class RuntimeHarness {
 
     const cascade = this.ensureCascadeState(prompt, currentModel);
     this.markExhausted(currentModel.provider);
-    const plan = this.buildFailoverPlan(currentModel);
+    const plan = this.buildFailoverPlan(currentModel, undefined);
 
     const continuation = formatFailoverContinuation(plan.candidates[0]);
     for (const skip of plan.skips) {
@@ -716,8 +735,140 @@ async function runRetryStartTurnChecks() {
   console.log("retry-start-turn checks passed");
 }
 
+function runSkipLowQuotaChecks() {
+  // Test 1: skipLowQuota=false does NOT skip "low" members (default behavior)
+  _quotaCacheMock.clear();
+  _quotaCacheMock.set("anthropic-2", { kind: "low", score: 12 });
+
+  const skipFalse = classifyPoolMemberSkip(
+    "primary",
+    "anthropic-2",
+    createAuthStorage(["anthropic-2"]),
+    false,
+    false,
+  );
+  assert.equal(skipFalse, null, "skipLowQuota=false should NOT skip low-quota members");
+
+  // Test 2: skipLowQuota=true DOES skip "low" members
+  const skipTrue = classifyPoolMemberSkip(
+    "primary",
+    "anthropic-2",
+    createAuthStorage(["anthropic-2"]),
+    false,
+    true,
+  );
+  assert.notEqual(skipTrue, null, "skipLowQuota=true should skip low-quota members");
+  assert.equal(skipTrue.reason, "exhausted");
+  assert.ok(skipTrue.detail.includes("quota low"), `Expected 'quota low' in detail, got: ${skipTrue.detail}`);
+
+  // Test 3: "blocked" is always skipped regardless of skipLowQuota
+  _quotaCacheMock.set("anthropic-3", { kind: "blocked", score: 3 });
+  const skipBlocked = classifyPoolMemberSkip(
+    "primary",
+    "anthropic-3",
+    createAuthStorage(["anthropic-3"]),
+    false,
+    false,
+  );
+  assert.notEqual(skipBlocked, null, "blocked should always be skipped");
+  assert.ok(skipBlocked.detail.includes("quota blocked"));
+
+  // Test 4: No cache entry -> no skip
+  _quotaCacheMock.clear();
+  const noCache = classifyPoolMemberSkip(
+    "primary",
+    "anthropic-2",
+    createAuthStorage(["anthropic-2"]),
+    false,
+    true,
+  );
+  assert.equal(noCache, null, "No cache entry should not skip");
+
+  _quotaCacheMock.clear();
+  console.log("skip-low-quota checks passed");
+}
+
+function runBuildFailoverPlanWithSkipLowQuotaChecks() {
+  _quotaCacheMock.clear();
+  _quotaCacheMock.set("anthropic-2", { kind: "low", score: 10 });
+
+  const config = createConfig();
+  config.chains = [];
+  const harness = new RuntimeHarness(config, [
+    "anthropic",
+    "anthropic-2",
+    "anthropic-3",
+  ]);
+
+  harness.startTurn("test prompt", { provider: "anthropic", id: "claude-sonnet-4" });
+
+  // Without skipLowQuota: anthropic-2 should be a candidate
+  const planNoSkip = harness.buildFailoverPlan(
+    { provider: "anthropic", id: "claude-sonnet-4" },
+    undefined,
+  );
+  assert.ok(
+    planNoSkip.candidates.some((c) => c.provider === "anthropic-2"),
+    "Without skipLowQuota, low-quota member should be a candidate",
+  );
+
+  // With skipLowQuota: anthropic-2 should be skipped
+  const planSkip = harness.buildFailoverPlan(
+    { provider: "anthropic", id: "claude-sonnet-4" },
+    { skipLowQuota: true },
+  );
+  assert.ok(
+    !planSkip.candidates.some((c) => c.provider === "anthropic-2"),
+    "With skipLowQuota, low-quota member should be skipped",
+  );
+  assert.ok(
+    planSkip.candidates.some((c) => c.provider === "anthropic-3"),
+    "anthropic-3 should still be available",
+  );
+  assert.ok(
+    planSkip.skips.some((s) => s.detail.includes("anthropic-2") && s.detail.includes("quota low")),
+    "Skip list should contain low-quota skip for anthropic-2",
+  );
+
+  _quotaCacheMock.clear();
+  console.log("build-failover-plan-skip-low-quota checks passed");
+}
+
+function runProactiveThresholdConfigChecks() {
+  // Verify the "blocked" threshold configuration is respected
+  // When pool.proactiveThreshold = "blocked", only kind === "blocked" should trigger
+  // When pool.proactiveThreshold = "low" (or undefined), both "blocked" and "low" should trigger
+
+  // Simulating the threshold logic from enforceProactiveRotation
+  function shouldRotate(kind, threshold) {
+    const t = threshold ?? "low";
+    return kind === "blocked" || (t === "low" && kind === "low");
+  }
+
+  // Default (undefined) = "low" threshold
+  assert.equal(shouldRotate("blocked", undefined), true, "blocked should trigger with default threshold");
+  assert.equal(shouldRotate("low", undefined), true, "low should trigger with default threshold");
+  assert.equal(shouldRotate("watch", undefined), false, "watch should NOT trigger with default threshold");
+  assert.equal(shouldRotate("ready", undefined), false, "ready should NOT trigger with default threshold");
+
+  // Explicit "low"
+  assert.equal(shouldRotate("blocked", "low"), true);
+  assert.equal(shouldRotate("low", "low"), true);
+  assert.equal(shouldRotate("watch", "low"), false);
+
+  // Explicit "blocked"
+  assert.equal(shouldRotate("blocked", "blocked"), true, "blocked should trigger with blocked threshold");
+  assert.equal(shouldRotate("low", "blocked"), false, "low should NOT trigger with blocked threshold");
+  assert.equal(shouldRotate("watch", "blocked"), false);
+
+  console.log("proactive-threshold-config checks passed");
+}
+
 runCoreChecks();
 runSessionStatusChecks();
+runSkipLowQuotaChecks();
+runBuildFailoverPlanWithSkipLowQuotaChecks();
+runProactiveThresholdConfigChecks();
 
 if (process.argv.includes("--retry-start-turn")) {
   await runRetryStartTurnChecks();
