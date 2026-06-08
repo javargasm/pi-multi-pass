@@ -251,10 +251,12 @@ function getCodexWindowRemaining(window) {
 }
 
 function classifyCodexQuotaKind(snapshot) {
-  const values = [getCodexWindowRemaining(snapshot.fiveHour), getCodexWindowRemaining(snapshot.weekly)]
-    .filter((value) => value !== undefined);
-  if (values.length === 0) return { kind: "error", score: 0 };
-  const bottleneck = Math.min(...values);
+  const fiveHourLeft = getCodexWindowRemaining(snapshot.fiveHour);
+  const weeklyLeft = getCodexWindowRemaining(snapshot.weekly);
+  // Use session (primary_window) as the main indicator for immediate availability.
+  // Fall back to weekly only when session data is not available from the API.
+  const bottleneck = fiveHourLeft ?? weeklyLeft ?? undefined;
+  if (bottleneck === undefined) return { kind: "error", score: 0 };
   if (bottleneck <= 6) return { kind: "blocked", score: bottleneck };
   if (bottleneck <= 15) return { kind: "low", score: bottleneck };
   if (bottleneck <= 30) return { kind: "watch", score: bottleneck };
@@ -415,21 +417,44 @@ function runWindowClassificationChecks() {
 }
 
 function runSeverityChecks() {
+  // Session-first: bottleneck is always fiveHour (primary_window)
   assert.equal(
     classifyCodexQuotaKind({ fiveHour: { usedPercent: 20 }, weekly: { usedPercent: 40 } }).kind,
     "ready",
   );
   assert.equal(
+    classifyCodexQuotaKind({ fiveHour: { usedPercent: 20 }, weekly: { usedPercent: 40 } }).score,
+    80, // session left, NOT min(80, 60)
+  );
+  assert.equal(
     classifyCodexQuotaKind({ fiveHour: { usedPercent: 75 }, weekly: { usedPercent: 20 } }).kind,
-    "watch",
+    "watch", // 25% session left
   );
   assert.equal(
     classifyCodexQuotaKind({ fiveHour: { usedPercent: 88 }, weekly: { usedPercent: 15 } }).kind,
-    "low",
+    "low", // 12% session left
   );
   assert.equal(
     classifyCodexQuotaKind({ fiveHour: { usedPercent: 97 }, weekly: { usedPercent: 10 } }).kind,
-    "blocked",
+    "blocked", // 3% session left
+  );
+  // Session unused (0%) → score is 100 (session left), weekly is irrelevant
+  assert.equal(
+    classifyCodexQuotaKind({ fiveHour: { usedPercent: 0 }, weekly: { usedPercent: 80 } }).kind,
+    "ready",
+  );
+  assert.equal(
+    classifyCodexQuotaKind({ fiveHour: { usedPercent: 0 }, weekly: { usedPercent: 80 } }).score,
+    100,
+  );
+  // Fallback to weekly only when session is unavailable
+  assert.equal(
+    classifyCodexQuotaKind({ weekly: { usedPercent: 80 } }).kind,
+    "watch",
+  );
+  assert.equal(
+    classifyCodexQuotaKind({ weekly: { usedPercent: 80 } }).score,
+    20,
   );
   assert.equal(classifyCodexQuotaKind({}).kind, "error");
 }
@@ -541,7 +566,7 @@ function runLimitsArrayParsingChecks() {
   assert.equal(snapshot1.weekly.usedPercent, 33);
 
   const kind1 = classifyCodexQuotaKind(snapshot1);
-  assert.equal(kind1.kind, "blocked", "1% remaining should be blocked");
+  assert.equal(kind1.kind, "blocked", "session 99% used → 1% left → blocked");
   assert.equal(kind1.score, 1);
 
   // Test 2: limits[] inside data.data.limits
@@ -587,13 +612,15 @@ function runLimitsArrayParsingChecks() {
 
 function runUsageBarsCacheChecks() {
   // Mirror the logic from multi-sub.ts tryBuildFromUsageBarsCache
+  // Session-first: bottleneck = sessionLeft (primary_window)
   function tryBuildFromCache(session, weekly, ageMs) {
     const TTL = 30_000;
     if (ageMs > TTL) return null;
 
     const sessionLeft = Math.max(0, Math.min(100, 100 - session));
     const weeklyLeft = Math.max(0, Math.min(100, 100 - weekly));
-    const bottleneck = Math.min(sessionLeft, weeklyLeft);
+    // Use session (primary_window) as the main indicator for immediate availability.
+    const bottleneck = sessionLeft;
 
     let kind;
     if (bottleneck <= 6) kind = "blocked";
@@ -604,19 +631,19 @@ function runUsageBarsCacheChecks() {
     return { kind, score: bottleneck, sessionLeft, weeklyLeft };
   }
 
-  // Test 1: session 100%, weekly 35% → blocked (session bottleneck = 0%)
+  // Test 1: session 100% used → blocked (0% session left)
   const r1 = tryBuildFromCache(100, 35, 0);
   assert.equal(r1.kind, "blocked");
   assert.equal(r1.score, 0);
 
-  // Test 2: session 10%, weekly 35% → ready (bottleneck = 65%)
+  // Test 2: session 10% used → ready (90% session left), weekly irrelevant
   const r2 = tryBuildFromCache(10, 35, 0);
   assert.equal(r2.kind, "ready");
-  assert.equal(r2.score, 65);
+  assert.equal(r2.score, 90); // session left, NOT 65 (weekly left)
   assert.equal(r2.sessionLeft, 90);
   assert.equal(r2.weeklyLeft, 65);
 
-  // Test 3: session 90%, weekly 50% → low (bottleneck = 10%)
+  // Test 3: session 90% used → low (10% session left)
   const r3 = tryBuildFromCache(90, 50, 0);
   assert.equal(r3.kind, "low");
   assert.equal(r3.score, 10);
@@ -625,20 +652,30 @@ function runUsageBarsCacheChecks() {
   const r4 = tryBuildFromCache(50, 50, 31_000);
   assert.equal(r4, null);
 
-  // Test 5: session 75%, weekly 80% → watch (bottleneck = 20%)
+  // Test 5: session 75% used → watch (25% session left), weekly irrelevant
   const r5 = tryBuildFromCache(75, 80, 5_000);
   assert.equal(r5.kind, "watch");
-  assert.equal(r5.score, 20);
+  assert.equal(r5.score, 25); // session left, NOT 20 (weekly left)
 
-  // Test 6: session 94%, weekly 94% → blocked (bottleneck = 6%)
+  // Test 6: session 94% used → blocked (6% session left)
   const r6 = tryBuildFromCache(94, 94, 0);
   assert.equal(r6.kind, "blocked");
   assert.equal(r6.score, 6);
 
-  // Test 7: session 85%, weekly 85% → low (bottleneck = 15%)
+  // Test 7: session 85% used → low (15% session left)
   const r7 = tryBuildFromCache(85, 85, 0);
   assert.equal(r7.kind, "low");
   assert.equal(r7.score, 15);
+
+  // Test 8: session unused (0%) → ready (100% session left), weekly irrelevant
+  const r8 = tryBuildFromCache(0, 80, 0);
+  assert.equal(r8.kind, "ready");
+  assert.equal(r8.score, 100);
+
+  // Test 9: session 1% used → ready (99% session left) — the user's actual case
+  const r9 = tryBuildFromCache(1, 36, 0);
+  assert.equal(r9.kind, "ready");
+  assert.equal(r9.score, 99);
 
   console.log("usage-bars cache checks passed");
 }

@@ -84,6 +84,7 @@ import {
 
 type CopilotCredentials = OAuthCredentials & { enterpriseUrl?: string };
 type GeminiCredentials = OAuthCredentials & { projectId?: string };
+type KiroCredentials = OAuthCredentials & { region?: string; clientId?: string; clientSecret?: string; authMethod?: string };
 
 interface ProviderTemplate {
 	displayName: string;
@@ -238,6 +239,65 @@ const PROVIDER_TEMPLATES: Record<string, ProviderTemplate> = {
 		},
 	},
 };
+
+// Kiro provider template — loaded lazily so pi-multi-pass works without pi-kiro installed.
+let kiroTemplateLoaded = false;
+let kiroStreamSimple: ProviderTemplate["builtinOAuth"]["login"] extends (...args: any[]) => any ? any : any = undefined;
+
+async function loadKiroTemplate(): Promise<boolean> {
+	if (kiroTemplateLoaded) return !!PROVIDER_TEMPLATES["kiro"];
+	kiroTemplateLoaded = true;
+	try {
+		const kiroCore = await import("pi-kiro/core");
+		const { loginKiro, refreshKiroToken, kiroModels, resolveApiRegion, resolveRuntimeUrl, streamKiro } = kiroCore;
+		kiroStreamSimple = streamKiro;
+
+		PROVIDER_TEMPLATES["kiro"] = {
+			displayName: "Kiro (AWS Builder ID / IAM IdC)",
+			builtinOAuth: {
+				id: "kiro",
+				name: "Kiro",
+				async login(callbacks: OAuthLoginCallbacks): Promise<OAuthCredentials> {
+					return loginKiro(callbacks);
+				},
+				async refreshToken(credentials: OAuthCredentials): Promise<OAuthCredentials> {
+					return refreshKiroToken(credentials);
+				},
+				getApiKey(credentials: OAuthCredentials): string {
+					return credentials.access;
+				},
+			},
+			buildOAuth(index: number) {
+				return {
+					name: `Kiro #${index}`,
+					async login(callbacks: OAuthLoginCallbacks): Promise<OAuthCredentials> {
+						return loginKiro(callbacks);
+					},
+					async refreshToken(credentials: OAuthCredentials): Promise<OAuthCredentials> {
+						return refreshKiroToken(credentials);
+					},
+					getApiKey(credentials: OAuthCredentials): string {
+						return credentials.access;
+					},
+				};
+			},
+			buildModifyModels(providerName: string) {
+				return (models: Model<Api>[], credentials: OAuthCredentials): Model<Api>[] => {
+					const kiroRegion = (credentials as KiroCredentials).region;
+					const apiRegion = resolveApiRegion(kiroRegion);
+					const baseUrl = resolveRuntimeUrl(apiRegion);
+					return models.map((m: any) =>
+						m.provider === providerName ? { ...m, baseUrl } : m,
+					);
+				};
+			},
+		};
+		return true;
+	} catch {
+		// pi-kiro not installed — kiro template unavailable
+		return false;
+	}
+}
 
 const SUPPORTED_PROVIDERS = Object.keys(PROVIDER_TEMPLATES);
 
@@ -710,11 +770,11 @@ function classifyCodexQuotaKind(snapshot: CodexUsageSnapshot): {
 } {
 	const fiveHourLeft = getCodexWindowRemaining(snapshot.fiveHour);
 	const weeklyLeft = getCodexWindowRemaining(snapshot.weekly);
-	const values = [fiveHourLeft, weeklyLeft].filter((value): value is number => value !== undefined);
-	if (values.length === 0) {
-		return { kind: "error", score: 0 };
-	}
-	const bottleneck = Math.min(...values);
+	
+	// Use session (primary_window) as the main indicator for immediate availability.
+	// Fall back to weekly only when session data is not available from the API.
+	const bottleneck = fiveHourLeft ?? weeklyLeft ?? 100;
+
 	if (bottleneck <= 6) return { kind: "blocked", score: bottleneck };
 	if (bottleneck <= 15) return { kind: "low", score: bottleneck };
 	if (bottleneck <= 30) return { kind: "watch", score: bottleneck };
@@ -1484,12 +1544,14 @@ function collectQuotaAccounts(ctx: ExtensionContext): QuotaAccount[] {
 // for the ACTIVE provider on every poll (~2 min). We cache it here so
 // codexQuotaChecker can skip the duplicate API call.
 interface UsageBarsCache {
+	providerName: string;
 	session: number; // used percent 0-100
 	weekly: number;  // used percent 0-100
 	timestamp: number;
 }
 let usageBarsCache: UsageBarsCache | null = null;
 const USAGE_BARS_CACHE_TTL_MS = 30_000; // 30 s
+let extensionPi: ExtensionAPI | null = null;
 
 /** Called from multiSub() entry point via pi.events.on("usage:update", ...) */
 function onUsageBarsUpdate(data: unknown): void {
@@ -1498,7 +1560,10 @@ function onUsageBarsUpdate(data: unknown): void {
 	const session = typeof rec.session === "number" ? rec.session : undefined;
 	const weekly = typeof rec.weekly === "number" ? rec.weekly : undefined;
 	if (session === undefined && weekly === undefined) return;
+	const providerName = extensionPi?.model?.provider;
+	if (!providerName) return;
 	usageBarsCache = {
+		providerName,
 		session: session ?? 0,
 		weekly: weekly ?? 0,
 		timestamp: Date.now(),
@@ -1509,13 +1574,15 @@ function tryBuildFromUsageBarsCache(
 	account: QuotaAccount,
 ): QuotaCheckResult | null {
 	if (!usageBarsCache) return null;
+	if (account.providerName !== usageBarsCache.providerName) return null;
 	if (Date.now() - usageBarsCache.timestamp > USAGE_BARS_CACHE_TTL_MS) return null;
 
 	const sessionUsed = usageBarsCache.session;
 	const weeklyUsed = usageBarsCache.weekly;
 	const sessionLeft = Math.max(0, Math.min(100, 100 - sessionUsed));
 	const weeklyLeft = Math.max(0, Math.min(100, 100 - weeklyUsed));
-	const bottleneck = Math.min(sessionLeft, weeklyLeft);
+	// Use session (primary_window) as the main indicator for immediate availability.
+	const bottleneck = sessionLeft;
 
 	let kind: QuotaStatusKind;
 	if (bottleneck <= 6) kind = "blocked";
@@ -2240,11 +2307,21 @@ function registerSub(pi: ExtensionAPI, entry: SubEntry): void {
 	const baseUrl = builtinModels[0]?.baseUrl || "";
 	const models = cloneModels(entry.provider, entry.index);
 
+	// Kiro requires its custom stream handler and auth header because it
+	// uses a non-standard API protocol (kiro-api / CodeWhisperer SSE).
+	const isKiro = entry.provider === "kiro";
+	const extras: Record<string, unknown> = {};
+	if (isKiro && kiroStreamSimple) {
+		extras.streamSimple = kiroStreamSimple;
+		extras.authHeader = true;
+	}
+
 	pi.registerProvider(name, {
 		baseUrl,
 		api: builtinModels[0]?.api,
 		oauth: modifyModels ? { ...oauth, modifyModels } : oauth,
 		models,
+		...extras,
 	});
 }
 
@@ -5880,9 +5957,24 @@ async function handlePresetMenu(
 // ==========================================================================
 
 export default function multiSub(pi: ExtensionAPI) {
+	extensionPi = pi;
 	const config = loadGlobalConfig();
 	const envEntries = parseEnvConfig();
 	const all = normalizeEntries(mergeConfigs(config, envEntries));
+
+	// Try to load Kiro provider template (async, fire-and-forget).
+	// If pi-kiro is installed, "kiro" becomes available in /subs add.
+	loadKiroTemplate().then((loaded) => {
+		if (loaded) {
+			SUPPORTED_PROVIDERS.push("kiro");
+			// Register any existing kiro subs that were skipped during initial load
+			for (const entry of all) {
+				if (entry.provider === "kiro") {
+					registerSub(pi, entry);
+				}
+			}
+		}
+	});
 
 	// Register all subscriptions (always global)
 	for (const entry of all) {

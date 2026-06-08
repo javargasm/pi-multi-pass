@@ -21,5 +21,13 @@
     "extensions": [
       "./extensions"
     ]
+  },
+  "peerDependencies": {
+    "pi-kiro": "*"
+  },
+  "peerDependenciesMeta": {
+    "pi-kiro": {
+      "optional": true
+    }
   }
 }
